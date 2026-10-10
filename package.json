@@ -1,0 +1,50 @@
+{
+  "name": "@swpsco/nockchain",
+  "version": "0.1.0",
+  "description": "Native TypeScript Nockchain V1 wallets, transactions, multisig and timelocks",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE",
+    "THIRD_PARTY_LICENSES"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "author": "SWPSCO",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SWPSCO/nockchain-js.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepack": "npm run build",
+    "check": "tsc --noEmit && prettier --check src test package.json tsconfig.json README.md SECURITY.md",
+    "format": "prettier --write src test package.json tsconfig.json README.md SECURITY.md"
+  },
+  "dependencies": {
+    "@noble/hashes": "2.4.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "prettier": "3.9.10",
+    "typescript": "7.0.2"
+  }
+}
