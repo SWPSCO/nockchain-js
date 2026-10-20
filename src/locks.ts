@@ -3,6 +3,8 @@ import {
   NockchainError,
   atom,
   atomValue,
+  boundedNoun,
+  hashEach,
   digest,
   digestEqual,
   digestNoun,
@@ -42,7 +44,7 @@ export interface TimelockPolicy {
   readonly relative: Range;
   readonly absolute: Range;
 }
-function range(value: HeightRange = {}): Range {
+export function range(value: HeightRange = {}): Range {
   const min = value.min ?? null,
     max = value.max ?? null;
   if (min !== null) atom(min);
@@ -78,86 +80,192 @@ function optionalHash(value: bigint | null): Digest {
     ? hashAtom(0n)
     : hashCell(hashAtom(0n), hashAtom(value));
 }
-function rangeNoun(value: Range): Noun {
+export function rangeNoun(value: Range): Noun {
   return new Cell(optional(value.min), optional(value.max));
 }
-function rangeHash(value: Range): Digest {
+export function rangeHash(value: Range): Digest {
   return hashCell(optionalHash(value.min), optionalHash(value.max));
 }
 
-/** Full m-of-n PKH policy, with optional inclusive conjunctive timelocks. */
-export class LockV1 {
+export interface RequiredPkhPolicy {
   readonly threshold: number;
   readonly keys: readonly Digest[];
-  readonly timelock: TimelockPolicy | null;
-  readonly root: Digest;
-  /** @internal */ readonly condition: Noun;
+}
+function digestSet(values: Iterable<Digest>): Noun {
+  const keys = Array.from(values, digest);
+  if (keys.length > 32 || new Set(keys.map(formatDigest)).size !== keys.length)
+    throw new NockchainError("Duplicate or excessive hash set entries");
+  let tree: Tree | null = null;
+  for (const key of keys)
+    tree = treePut(tree, newTree(digestNoun(key), 0n, key, key, false));
+  return treeNoun(tree);
+}
+function readDigestSet(noun: Noun): { keys: Digest[]; tree: Tree | null } {
+  const keys: Digest[] = [];
+  const tree = readTree(noun, false, 32, (key) => {
+    const value = nounDigest(key);
+    keys.push(value);
+    return [value, value];
+  });
+  return { keys, tree };
+}
+/** One conjunctive spend condition. LockTreeV1 provides alternative conditions. */
+export class LockV1 {
+  readonly threshold!: number;
+  readonly keys!: readonly Digest[];
+  readonly timelock!: TimelockPolicy | null;
+  readonly hashes!: readonly Digest[];
+  readonly root!: Digest;
+  readonly condition!: Noun;
+  readonly times!: readonly TimelockPolicy[];
+  readonly policies!: readonly RequiredPkhPolicy[];
+  readonly isBurn!: boolean;
   constructor(
     threshold: number,
     keys: Iterable<Digest>,
     time: TimelockV1 | null = null,
+    hashes: Iterable<Digest> = [],
   ) {
     const list = Array.from(keys, digest);
     if (
       !Number.isSafeInteger(threshold) ||
       threshold < 1 ||
-      threshold > list.length ||
-      list.length > 32 ||
-      new Set(list.map(formatDigest)).size !== list.length
+      threshold > list.length
     )
-      throw new NockchainError("Invalid signature threshold or duplicate keys");
-    this.threshold = threshold;
-    this.keys = Object.freeze(list);
-    this.timelock =
-      time === null
-        ? null
-        : Object.freeze({
-            relative: range(time.relative),
-            absolute: range(time.absolute),
-          });
-    let tree: Tree | null = null;
-    for (const key of this.keys)
-      tree = treePut(tree, newTree(digestNoun(key), 0n, key, key, false));
-    const pkh = nounTuple(0x686b70n, BigInt(threshold), treeNoun(tree));
-    let tail: Noun = 0n,
-      tailHash = hashAtom(0n);
-    if (this.timelock) {
-      const time = this.timelock;
-      tail = nounList(
+      throw new NockchainError("Invalid signature threshold");
+    const primitives: Noun[] = [
+      nounTuple(0x686b70n, BigInt(threshold), digestSet(list)),
+    ];
+    if (time)
+      primitives.push(
         nounTuple(
           0x6d6974n,
-          rangeNoun(time.relative),
-          rangeNoun(time.absolute),
+          rangeNoun(range(time.relative)),
+          rangeNoun(range(time.absolute)),
         ),
       );
-      tailHash = hashCell(
-        foldHashes(
-          hashAtom(0x6d6974n),
-          rangeHash(time.relative),
-          rangeHash(time.absolute),
-        ),
-        tailHash,
-      );
+    const required = Array.from(hashes);
+    if (required.length)
+      primitives.push(new Cell(0x786168n, digestSet(required)));
+    this.initialize(nounList(...primitives));
+  }
+  private initialize(noun: Noun): void {
+    boundedNoun(noun);
+    const values: Digest[] = [],
+      times: TimelockPolicy[] = [],
+      policies: RequiredPkhPolicy[] = [],
+      hashes: Digest[] = [];
+    let tail = noun,
+      isBurn = false;
+    while (tail instanceof Cell) {
+      const [tag, body] = parts(tail.head, 2);
+      if (tag === 0x686b70n) {
+        const [n, set] = parts(body, 2),
+          threshold = Number(atomValue(n)),
+          { keys, tree } = readDigestSet(set);
+        if (threshold < 1 || threshold > keys.length)
+          throw new NockchainError("Invalid signature threshold");
+        policies.push(Object.freeze({ threshold, keys: Object.freeze(keys) }));
+        values.push(
+          foldHashes(
+            hashAtom(tag),
+            hashAtom(BigInt(threshold)),
+            treeDigest(tree),
+          ),
+        );
+      } else if (tag === 0x6d6974n) {
+        const [rel, abs] = parts(body, 2),
+          time = Object.freeze({
+            relative: parseRange(rel),
+            absolute: parseRange(abs),
+          });
+        times.push(time);
+        values.push(
+          foldHashes(
+            hashAtom(tag),
+            rangeHash(time.relative),
+            rangeHash(time.absolute),
+          ),
+        );
+      } else if (tag === 0x786168n) {
+        const { keys, tree } = readDigestSet(body);
+        hashes.push(...keys);
+        values.push(hashCell(hashAtom(tag), treeDigest(tree)));
+      } else if (tag === 0x6e7262n && body === 0n) {
+        isBurn = true;
+        values.push(hashCell(hashAtom(tag), hashAtom(0n)));
+      } else throw new NockchainError("Invalid lock primitive");
+      tail = tail.tail;
     }
-    this.root = hashCell(
-      foldHashes(
-        hashAtom(0x686b70n),
-        hashAtom(BigInt(threshold)),
-        treeDigest(tree),
+    if (tail !== 0n || !values.length)
+      throw new NockchainError("Empty or malformed spend condition");
+    let root = hashAtom(0n);
+    for (const value of values.reverse()) root = hashCell(value, root);
+    let keys = policies[0]?.keys ?? [];
+    for (const policy of policies.slice(1))
+      keys = keys.filter((key) => policy.keys.some((k) => digestEqual(k, key)));
+    Object.assign(this, {
+      threshold: policies[0]?.threshold ?? 0,
+      keys: Object.freeze(keys),
+      timelock: times[0] ?? null,
+      hashes: Object.freeze(
+        Array.from(new Map(hashes.map((h) => [formatDigest(h), h])).values()),
       ),
-      tailHash,
-    );
-    this.condition = new Cell(pkh, tail);
+      root,
+      condition: noun,
+      times: Object.freeze(times),
+      policies: Object.freeze(policies),
+      isBurn,
+    });
     Object.freeze(this);
   }
-  metadata(): Noun {
-    return nounTuple(
-      new Cell(0x6b636f6cn, new Cell(0n, this.condition)),
-      0n,
-      0n,
-    );
+  static fromNoun(noun: Noun): LockV1 {
+    const value = Object.create(LockV1.prototype) as LockV1;
+    value.initialize(noun);
+    return value;
   }
-  /** @internal */ proof(): Noun {
+  static hashlock(hashes: Iterable<Digest>): LockV1 {
+    return LockV1.fromNoun(nounList(new Cell(0x786168n, digestSet(hashes))));
+  }
+  static burn(): LockV1 {
+    return LockV1.fromNoun(nounList(new Cell(0x6e7262n, 0n)));
+  }
+  noun(): Noun {
+    return this.condition;
+  }
+  requiredPkhPolicy(): RequiredPkhPolicy | null {
+    if (!this.policies.length) return null;
+    if (
+      this.policies.some((p) => p.threshold !== this.threshold) ||
+      this.keys.length < this.threshold
+    )
+      throw new NockchainError(
+        "PKH conditions cannot share a satisfying signature map",
+      );
+    return Object.freeze({ threshold: this.threshold, keys: this.keys });
+  }
+  allows(
+    height: bigint | null,
+    origin: bigint,
+    preimages: readonly Noun[] = [],
+  ): boolean {
+    if (this.isBurn) return false;
+    this.requiredPkhPolicy();
+    if (
+      this.times.length &&
+      (height === null ||
+        this.times.some((t) => !timelockAllows(t, height, origin)))
+    )
+      return false;
+    const supplied = new Set(
+      preimages.map((value) => formatDigest(hashEach(value))),
+    );
+    return this.hashes.every((h) => supplied.has(formatDigest(h)));
+  }
+  metadata(): Noun {
+    return nounTuple(new Cell(0x6b636f6cn, new Cell(0n, this.noun())), 0n, 0n);
+  }
+  proof(): Noun {
     return nounTuple(
       0x6c6c7566n,
       this.condition,
@@ -165,7 +273,7 @@ export class LockV1 {
       new Cell(digestNoun(this.root), 0n),
     );
   }
-  /** @internal */ proofHash(): Digest {
+  proofHash(): Digest {
     return foldHashes(
       hashAtom(0x6c6c7566n),
       this.root,
@@ -244,32 +352,10 @@ function parseOptional(noun: Noun): bigint | null {
   if (tag !== 0n) throw new NockchainError("Invalid optional height");
   return atomValue(value);
 }
-function parseRange(noun: Noun): Range {
+export function parseRange(noun: Noun): Range {
   const [min, max] = parts(noun, 2);
   return range({ min: parseOptional(min), max: parseOptional(max) });
 }
 export function parseCondition(noun: Noun): LockV1 {
-  if (!(noun instanceof Cell))
-    throw new NockchainError("Unsupported lock condition");
-  const [tag, threshold, keyset] = parts(noun.head, 3);
-  if (tag !== 0x686b70n) throw new NockchainError("Unsupported lock primitive");
-  const value = atomValue(threshold);
-  if (value > 32n) throw new NockchainError("Invalid signature threshold");
-  const keys: Digest[] = [];
-  readTree(keyset, false, 32, (key) => {
-    const value = nounDigest(key);
-    keys.push(value);
-    return [value, value];
-  });
-  let time: TimelockV1 | null = null;
-  const tail = noun.tail;
-  if (tail !== 0n) {
-    if (!(tail instanceof Cell) || tail.tail !== 0n)
-      throw new NockchainError("Unsupported lock condition");
-    const [tag, relative, absolute] = parts(tail.head, 3);
-    if (tag !== 0x6d6974n)
-      throw new NockchainError("Unsupported lock primitive");
-    time = { relative: parseRange(relative), absolute: parseRange(absolute) };
-  }
-  return new LockV1(Number(value), keys, time);
+  return LockV1.fromNoun(noun);
 }

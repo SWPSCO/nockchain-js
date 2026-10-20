@@ -1,7 +1,7 @@
 {
   "name": "@swpsco/nockchain",
-  "version": "0.1.0",
-  "description": "Native TypeScript Nockchain V1 wallets, transactions, multisig and timelocks",
+  "version": "0.2.0",
+  "description": "Native TypeScript Nockchain wallet planning, lock policies and transactions",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
