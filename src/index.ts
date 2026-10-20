@@ -133,3 +133,9 @@ export type { PlanRequest, PlanResult } from "./planner.js";
 
 export { LockV0, NoteV0, noteFirstV0 } from "./migration.js";
 export type { NoteRecordV0 } from "./migration.js";
+export { inspectSigningBundle, signSigningBundle } from "./signing.js";
+export type {
+  SigningBundleV1,
+  SigningPayment,
+  SigningReviewV1,
+} from "./signing.js";

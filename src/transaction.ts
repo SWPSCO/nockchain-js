@@ -360,9 +360,9 @@ export class TransactionV1 {
       }
     }
   }
-  /** Check exact thresholds, every signature, authorization and minimum fee. */
-  verifySignatures(): void {
-    this.#verify(true);
+  /** Check signatures, authorization and minimum fee; optionally allow missing signatures. */
+  verifySignatures({ requireThreshold = true } = {}): void {
+    this.#verify(requireThreshold);
     const review = this.summary();
     if (review.feeNicks < review.minimumFeeNicks)
       throw new NockchainError("Fee below minimum");

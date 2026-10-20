@@ -1,6 +1,6 @@
 {
   "name": "@swpsco/nockchain",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Native TypeScript Nockchain wallet planning, lock policies and transactions",
   "type": "module",
   "main": "./dist/index.js",
@@ -13,6 +13,7 @@
   },
   "files": [
     "dist",
+    "bin",
     "src",
     "README.md",
     "SECURITY.md",
@@ -36,8 +37,8 @@
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test test/*.test.mjs",
     "prepack": "npm run build",
-    "check": "tsc --noEmit && prettier --check src test package.json tsconfig.json README.md SECURITY.md",
-    "format": "prettier --write src test package.json tsconfig.json README.md SECURITY.md"
+    "check": "tsc --noEmit && prettier --check src test bin package.json tsconfig.json README.md SECURITY.md",
+    "format": "prettier --write src test bin package.json tsconfig.json README.md SECURITY.md"
   },
   "dependencies": {
     "@noble/hashes": "2.4.0"
@@ -46,5 +47,8 @@
     "esbuild": "0.28.2",
     "prettier": "3.9.10",
     "typescript": "7.0.2"
+  },
+  "bin": {
+    "nockchain": "./bin/nockchain.mjs"
   }
 }

@@ -21,7 +21,9 @@ jobs:
       - run: |
           archive="$PWD/$(node -p 'require("./package.json").name.replace("@", "").replace("/", "-") + "-" + require("./package.json").version + ".tgz"')"
           package_test="$(mktemp -d)"
+          node --input-type=module -e 'import fs from "node:fs"; const fixture = JSON.parse(fs.readFileSync("testdata/signing-bundles.json")); fs.writeFileSync(process.argv[1], JSON.stringify(fixture.cases[0].response.bundle));' "$package_test/bundle.json"
           cd "$package_test"
           npm init -y
           npm install "$archive"
           node --input-type=module -e 'import {parseNocks} from "@swpsco/nockchain"; if (parseNocks("1.25") !== 81920n) throw Error("package smoke test");'
+          ./node_modules/.bin/nockchain inspect bundle.json

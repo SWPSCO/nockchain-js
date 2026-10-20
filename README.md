@@ -13,6 +13,43 @@ declarations are included. Browser applications can bundle the package with thei
 usual build tool. The only runtime dependency is `@noble/hashes` for SHA-2, HMAC,
 PBKDF2, and secure random bytes.
 
+## Sign a Nockblocks bundle locally
+
+The remote Nockblocks MCP exposes `v1_prepareTransaction` through its `search`
+and `execute` tools. Save the returned `result.bundle` object as `bundle.json`.
+The npm command runs locally without a native binary or a local MCP server:
+
+```sh
+npx @swpsco/nockchain@0.3.0 inspect bundle.json
+npx @swpsco/nockchain@0.3.0 sign bundle.json --out signed.json
+```
+
+`sign` shows the locally reconstructed payment review and asks for `SIGN` before
+prompting for a hidden zprv. It requires an interactive terminal. `--key-file`
+reads a local plain-text zprv; `--path` derives an explicitly named child key.
+For recovery phrases, use `--mnemonic --path "m/..."` and add `--passphrase` when
+needed. The path must identify the key for the bundle's source address.
+Keep secrets out of MCP requests, chats, shell arguments, and transaction files.
+
+The command checks canonical encoding, existing signatures, full input
+commitments, maturity, recipients, change, and the locally recomputed payment
+plan and fee. Bundles support V1 inputs that one source key can spend, including
+mature coinbase notes. A small remainder that the planner assigns to the fee is
+shown in `feeNicks`. The output file is created with owner-only permissions and
+must not already exist. The command does not broadcast. After explicit approval
+to submit, pass the signed file's `rawTransaction` to `v1_submitTransaction`.
+
+Network, tip, and input records are supplied by the indexer. They are not proof
+of unspent status or finality, and the network label is not a consensus signature
+domain. Compare the review with the intended payment and a trusted chain-state
+source. The HTTP MCP returns data; it cannot launch the local command.
+
+Applications use `inspectSigningBundle(value)` for `{ bundle, transaction,
+review }` and `signSigningBundle(value, key)` for a signed bundle. Both validate
+the bundle. Applications obtain the user's authorization before calling the
+signing function. `verifySignatures({ requireThreshold: false })` checks existing
+signatures and fee coverage while allowing missing signatures.
+
 ## Receive from a public branch
 
 ```ts
