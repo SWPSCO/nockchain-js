@@ -15,6 +15,7 @@ import {
   hashAtom,
   hashCell,
   hashNoun,
+  hashEach,
   leafCount,
   nounDigest,
   nounEqual,
@@ -42,15 +43,25 @@ import {
   publicNoun,
   verifyDigest,
 } from "./keys.js";
-import {
-  LockV1,
-  NoteName,
-  NoteV1,
-  noteFirstV1,
-  parseCondition,
-  timelockAllows,
-} from "./locks.js";
+import { LockV1, NoteName, NoteV1 } from "./locks.js";
 
+import {
+  LockTreeV1,
+  LockMerkleProof,
+  buildLockMerkleProof,
+  parseLock,
+  parsePreimages,
+  preimageTree,
+} from "./lock-tree.js";
+import type { LockFormV1 } from "./lock-tree.js";
+import { FeeParameters, computeMinimumFee } from "./fee.js";
+import { FundLockPolicy } from "./lock-resolver.js";
+import { NoteV0, LockV0, noteFirstV0 } from "./migration.js";
+export interface TransactionOptions {
+  readonly fees?: FeeParameters;
+  readonly fundPolicy?: FundLockPolicy | null;
+  readonly migrationNotes?: readonly NoteV0[];
+}
 export const MAX_TRANSFER_INPUTS = 64;
 export const MAX_TRANSFER_OUTPUTS = 256;
 export const MAX_NOTE_DATA_WORDS_V1 = 2048;
@@ -58,12 +69,15 @@ export function addAmount(a: bigint, b: bigint): bigint {
   return uint(a + b, undefined, "amount total");
 }
 export interface LockedPaymentV1 {
-  readonly lock: LockV1;
+  readonly lock: LockFormV1 | Digest;
+  readonly noteData?: Noun;
   readonly nicks: bigint;
 }
 export interface LockedSpendPlanV1 {
-  readonly note: NoteV1;
-  readonly lock: LockV1;
+  readonly note: NoteV1 | NoteV0;
+  readonly lock: LockFormV1 | LockV0;
+  readonly leafNumber?: number;
+  readonly preimages?: readonly Noun[];
   readonly outputs: readonly LockedPaymentV1[];
   readonly fee: bigint;
 }
@@ -80,14 +94,14 @@ export class OutputV1 {
     Object.freeze(this);
   }
   /** Authenticate the policy in the metadata against the committed lock root. */
-  lock(): LockV1 {
+  lock(): LockFormV1 {
     const value = metadataEntries(this.noteData).get(0x6b636f6cn);
     if (value === undefined)
       throw new NockchainError("Output lock metadata is absent");
     const [tag, condition] = parts(value, 2);
     if (tag !== 0n)
       throw new NockchainError("Unsupported output lock metadata");
-    const lock = parseCondition(condition);
+    const lock = parseLock(condition);
     if (!digestEqual(lock.root, this.lockRoot))
       throw new NockchainError(
         "Output metadata does not authenticate its lock",
@@ -96,8 +110,9 @@ export class OutputV1 {
   }
 }
 export interface SpendSummaryV1 {
+  readonly proof: LockMerkleProof | null;
   readonly name: NoteName;
-  readonly lock: LockV1;
+  readonly lock: LockV1 | LockV0;
   readonly fee: bigint;
   readonly outputs: readonly OutputV1[];
   readonly signedKeys: readonly Digest[];
@@ -116,8 +131,11 @@ interface SignedPKH {
   readonly signature: Signature;
 }
 interface Spend {
+  readonly migrationNote: NoteV0 | null;
+  readonly proof: LockMerkleProof | null;
+  readonly preimages: readonly Noun[];
   readonly name: NoteName;
-  readonly lock: LockV1;
+  readonly lock: LockV1 | LockV0;
   readonly fee: bigint;
   readonly seeds: Tree | null;
   readonly outputs: readonly OutputV1[];
@@ -131,15 +149,17 @@ function signatureTree(spend: Spend): Tree | null {
   for (const signed of spend.signatures) {
     const publicKey = publicNoun(parsePoint(signed.publicKey)),
       signature = signed.signature.noun();
-    const hash = hashCell(
-      signed.pkh,
-      hashCell(hashNoun(publicKey), hashNoun(signature)),
-    );
+    const hash = spend.migrationNote
+      ? hashCell(signed.pkh, hashNoun(signature))
+      : hashCell(
+          signed.pkh,
+          hashCell(hashNoun(publicKey), hashNoun(signature)),
+        );
     tree = treePut(
       tree,
       newTree(
-        digestNoun(signed.pkh),
-        new Cell(publicKey, signature),
+        spend.migrationNote ? publicKey : digestNoun(signed.pkh),
+        spend.migrationNote ? signature : new Cell(publicKey, signature),
         hash,
         hash,
         true,
@@ -149,13 +169,26 @@ function signatureTree(spend: Spend): Tree | null {
   return tree;
 }
 function witness(spend: Spend): Noun {
-  return nounTuple(spend.lock.proof(), treeNoun(signatureTree(spend)), 0n, 0n);
+  if (spend.migrationNote) return treeNoun(signatureTree(spend));
+  return nounTuple(
+    spend.proof!.noun(),
+    treeNoun(signatureTree(spend)),
+    treeNoun(preimageTree(spend.preimages)),
+    0n,
+  );
 }
 function spendHash(spend: Spend): Digest {
+  if (spend.migrationNote)
+    return foldHashes(
+      hashAtom(0n),
+      treeDigest(signatureTree(spend)),
+      treeDigest(spend.seeds),
+      hashAtom(spend.fee),
+    );
   const hash = foldHashes(
-    spend.lock.proofHash(),
+    spend.proof!.hash(),
     treeDigest(signatureTree(spend)),
-    hashAtom(0n),
+    treeDigest(preimageTree(spend.preimages)),
     hashAtom(0n),
   );
   return foldHashes(
@@ -166,17 +199,40 @@ function spendHash(spend: Spend): Digest {
   );
 }
 function spendNoun(spend: Spend): Noun {
-  return nounTuple(1n, witness(spend), treeNoun(spend.seeds), spend.fee);
+  return nounTuple(
+    spend.migrationNote ? 0n : 1n,
+    witness(spend),
+    treeNoun(spend.seeds),
+    spend.fee,
+  );
 }
-function minimumFee(spends: readonly Spend[]): bigint {
+function minimumFee(
+  spends: readonly Spend[],
+  fees = new FeeParameters(),
+): bigint {
+  let unmergedWords = 0;
   let witnessWords = 0;
   const metadata = new Map<string, Map<bigint, Noun>>();
   for (const spend of spends) {
-    witnessWords +=
-      leafCount(spend.lock.proof()) +
-      Math.max(spend.signatures.length, spend.lock.threshold) * 35 +
-      3;
+    const signatures = Math.max(spend.signatures.length, spend.lock.threshold);
+    witnessWords += spend.migrationNote
+      ? 1 + signatures * 30
+      : leafCount(spend.proof!.noun()) +
+        leafCount(treeNoun(preimageTree(spend.preimages))) +
+        signatures * 35 +
+        2;
     for (const output of spend.outputs) {
+      const words =
+        1 +
+        [...metadataEntries(output.noteData).values()].reduce<number>(
+          (n, v) => n + 1 + leafCount(v),
+          0,
+        );
+      if (words > MAX_NOTE_DATA_WORDS_V1)
+        throw new NockchainError(
+          "Output metadata exceeds consensus word limit",
+        );
+      unmergedWords += words;
       const root = formatDigest(output.lockRoot);
       let entries = metadata.get(root);
       if (!entries) {
@@ -199,8 +255,11 @@ function minimumFee(spends: readonly Spend[]): bigint {
       throw new NockchainError("Output metadata exceeds consensus word limit");
     dataWords += words;
   }
-  const fee = BigInt(dataWords) * 16384n + BigInt(witnessWords) * 4096n;
-  return fee > 256n ? fee : 256n;
+  return computeMinimumFee(
+    BigInt(fees.height >= fees.bythosPhase ? dataWords : unmergedWords),
+    BigInt(witnessWords),
+    fees,
+  ).minimumFee;
 }
 const TX_TOKEN = Symbol("transaction");
 
@@ -208,9 +267,18 @@ const TX_TOKEN = Symbol("transaction");
 export class TransactionV1 {
   readonly #spends: readonly Spend[];
   readonly #raw: Noun;
+  readonly #fees: FeeParameters;
+  readonly #fundPolicy: FundLockPolicy | null;
   readonly id: Digest;
   /** @internal Use prepareTransactionV1() or parseTransactionV1(). */
-  constructor(token: symbol, spends: readonly Spend[], raw: Noun, id: Digest) {
+  constructor(
+    token: symbol,
+    spends: readonly Spend[],
+    raw: Noun,
+    id: Digest,
+    fees = new FeeParameters(),
+    fundPolicy: FundLockPolicy | null = null,
+  ) {
     if (token !== TX_TOKEN)
       throw new NockchainError(
         "Use prepareTransactionV1 or parseTransactionV1",
@@ -225,6 +293,8 @@ export class TransactionV1 {
       ),
     );
     this.#raw = raw;
+    this.#fees = fees;
+    this.#fundPolicy = fundPolicy;
     this.id = id;
     Object.freeze(this);
   }
@@ -249,6 +319,7 @@ export class TransactionV1 {
         Object.freeze({
           name: spend.name,
           lock: spend.lock,
+          proof: spend.proof,
           fee: spend.fee,
           outputs: spend.outputs,
           signedKeys: Object.freeze(
@@ -262,7 +333,7 @@ export class TransactionV1 {
       id: this.id,
       feeNicks,
       outputNicks,
-      minimumFeeNicks: minimumFee(this.#spends),
+      minimumFeeNicks: minimumFee(this.#spends, this.#fees),
       spends: Object.freeze(spends),
     });
   }
@@ -328,7 +399,7 @@ export class TransactionV1 {
     });
     if (!matched)
       throw new NockchainError("Key is not authorized by any input");
-    const result = assemble(spends),
+    const result = assemble(spends, this.#fees, this.#fundPolicy),
       review = result.summary();
     if (review.feeNicks < review.minimumFeeNicks)
       throw new NockchainError("Fee cannot cover additional signatures");
@@ -337,6 +408,27 @@ export class TransactionV1 {
   mergeSignatures(other: TransactionV1): TransactionV1 {
     this.#verify(false);
     other.#verify(false);
+    const a = this.#fundPolicy,
+      b = other.#fundPolicy;
+    if (
+      (
+        [
+          "height",
+          "bythosPhase",
+          "baseFee",
+          "inputFeeDivisor",
+          "minFee",
+        ] as const
+      ).some((k) => this.#fees[k] !== other.#fees[k]) ||
+      (a === null) !== (b === null) ||
+      (a &&
+        b &&
+        (!digestEqual(a.lockRoot, b.lockRoot) ||
+          !digestEqual(a.firstName, b.firstName) ||
+          a.maturity.activationHeight !== b.maturity.activationHeight ||
+          a.maturity.minimum !== b.maturity.minimum))
+    )
+      throw new NockchainError("Different transaction context");
     if (this.#spends.length !== other.#spends.length)
       throw new NockchainError("Different transaction plans");
     const byName = new Map(
@@ -347,7 +439,15 @@ export class TransactionV1 {
       if (
         !alternate ||
         alternate.fee !== spend.fee ||
-        !nounEqual(alternate.lock.condition, spend.lock.condition) ||
+        (alternate.proof === null) !== (spend.proof === null) ||
+        !nounEqual(
+          alternate.proof?.noun() ?? alternate.migrationNote!.noun(),
+          spend.proof?.noun() ?? spend.migrationNote!.noun(),
+        ) ||
+        !nounEqual(
+          treeNoun(preimageTree(alternate.preimages)),
+          treeNoun(preimageTree(spend.preimages)),
+        ) ||
         !nounEqual(treeNoun(alternate.seeds), treeNoun(spend.seeds))
       )
         throw new NockchainError("Different transaction plans");
@@ -372,14 +472,14 @@ export class TransactionV1 {
         throw new NockchainError("Merged signatures exceed the threshold");
       return { ...spend, signatures: [...signatures.values()] };
     });
-    const result = assemble(spends),
+    const result = assemble(spends, this.#fees, this.#fundPolicy),
       review = result.summary();
     if (review.feeNicks < review.minimumFeeNicks)
       throw new NockchainError("Fee cannot cover merged signatures");
     return result;
   }
   /** Applications authenticate supplied records against canonical chain state. */
-  validateInputs(records: Iterable<NoteV1>, height: bigint): void {
+  validateInputs(records: Iterable<NoteV1 | NoteV0>, height: bigint): void {
     atom(height);
     const notes = Array.from(records);
     if (notes.length !== this.#spends.length)
@@ -391,12 +491,31 @@ export class TransactionV1 {
       const note = byName.get(spend.name.key());
       if (!note) throw new NockchainError("Missing input record");
       const parent = note.hash();
-      if (
-        note.originPage > height ||
-        (spend.lock.timelock &&
-          !timelockAllows(spend.lock.timelock, height, note.originPage))
-      )
-        throw new NockchainError("Input timelock or origin is not satisfied");
+      if (spend.migrationNote) {
+        if (
+          !(note instanceof NoteV0) ||
+          !nounEqual(note.noun(), spend.migrationNote.noun()) ||
+          !note.admits(height)
+        )
+          throw new NockchainError(
+            "Migration input lock or timelock is not satisfied",
+          );
+      } else {
+        if (!(note instanceof NoteV1) || !(spend.lock instanceof LockV1))
+          throw new NockchainError("Input version differs from spend");
+        const fund =
+          this.#fundPolicy?.authenticates(spend.proof!, note.name.first) ??
+          false;
+        if (
+          (!fund &&
+            (!spend.proof!.check(note.name.first) ||
+              note.originPage > height)) ||
+          (fund &&
+            !this.#fundPolicy!.maturity.at(height).admits(note.originPage)) ||
+          !spend.lock.allows(height, note.originPage, spend.preimages)
+        )
+          throw new NockchainError("Input lock or maturity is not satisfied");
+      }
       let total = spend.fee;
       for (const output of spend.outputs) {
         if (!digestEqual(output.parentHash, parent))
@@ -408,7 +527,11 @@ export class TransactionV1 {
     }
   }
 }
-function assemble(spends: readonly Spend[]): TransactionV1 {
+function assemble(
+  spends: readonly Spend[],
+  fees = new FeeParameters(),
+  fundPolicy: FundLockPolicy | null = null,
+): TransactionV1 {
   if (!spends.length || spends.length > MAX_TRANSFER_INPUTS)
     throw new NockchainError("Input count out of range");
   if (
@@ -427,12 +550,31 @@ function assemble(spends: readonly Spend[]): TransactionV1 {
   const id = hashCell(hashAtom(1n), treeDigest(tree)),
     raw = nounTuple(1n, digestNoun(id), treeNoun(tree));
   boundedNoun(raw);
-  const result = new TransactionV1(TX_TOKEN, spends, raw, id);
+  const result = new TransactionV1(TX_TOKEN, spends, raw, id, fees, fundPolicy);
   result.summary();
   return result;
 }
+function checkUnlock(proof: LockMerkleProof, preimages: readonly Noun[]): void {
+  proof.condition.requiredPkhPolicy();
+  preimageTree(preimages);
+  const supplied = new Set(preimages.map((v) => formatDigest(hashEach(v))));
+  if (
+    proof.condition.isBurn ||
+    proof.condition.hashes.some((h) => !supplied.has(formatDigest(h)))
+  )
+    throw new NockchainError("Burned condition or missing hashlock preimage");
+}
 export function prepareTransactionV1(
   plans: Iterable<LockedSpendPlanV1>,
+  options: TransactionOptions = {},
+): TransactionV1 {
+  return prepareTransaction(plans, options, true);
+}
+/** @internal Planner assembles before solving its final fee. */
+export function prepareTransaction(
+  plans: Iterable<LockedSpendPlanV1>,
+  { fees = new FeeParameters(), fundPolicy = null }: TransactionOptions = {},
+  checkFee = false,
 ): TransactionV1 {
   const list = Array.from(plans);
   if (!list.length || list.length > MAX_TRANSFER_INPUTS)
@@ -440,15 +582,45 @@ export function prepareTransactionV1(
   const seen = new Set<string>(),
     spends: Spend[] = [];
   for (const plan of list) {
-    if (!(plan.note instanceof NoteV1) || !(plan.lock instanceof LockV1))
+    if (
+      !(plan.note instanceof NoteV1 || plan.note instanceof NoteV0) ||
+      !(
+        plan.lock instanceof LockV1 ||
+        plan.lock instanceof LockTreeV1 ||
+        plan.lock instanceof LockV0
+      )
+    )
       throw new NockchainError("Invalid input plan");
     const parent = plan.note.hash();
+    const migrationNote = plan.note instanceof NoteV0 ? plan.note : null,
+      preimages = plan.preimages ?? [];
+    let proof: LockMerkleProof | null = null,
+      authorized = false;
+    if (migrationNote) {
+      authorized =
+        plan.lock instanceof LockV0 &&
+        digestEqual(plan.lock.root, migrationNote.lock.root) &&
+        digestEqual(
+          plan.note.name.first,
+          noteFirstV0(plan.lock, migrationNote.timelock !== null),
+        ) &&
+        !preimages.length &&
+        (plan.leafNumber ?? 1) === 1;
+    } else {
+      if (plan.lock instanceof LockV0)
+        throw new NockchainError("Input and lock version differ");
+      proof = buildLockMerkleProof(
+        plan.lock,
+        plan.leafNumber ?? 1,
+        fees.height >= fees.bythosPhase,
+      );
+      authorized =
+        (fundPolicy?.authenticates(proof, plan.note.name.first) ?? false) ||
+        proof.check(plan.note.name.first);
+      checkUnlock(proof, preimages);
+    }
     atom(plan.fee);
-    if (
-      !digestEqual(plan.note.name.first, noteFirstV1(plan.lock.root)) ||
-      seen.has(plan.note.name.key()) ||
-      !plan.outputs.length
-    )
+    if (!authorized || seen.has(plan.note.name.key()) || !plan.outputs.length)
       throw new NockchainError("Invalid, duplicate, or lock-mismatched input");
     seen.add(plan.note.name.key());
     const roots = new Set<string>(),
@@ -456,23 +628,30 @@ export function prepareTransactionV1(
     let seeds: Tree | null = null,
       total = plan.fee;
     for (const output of plan.outputs) {
-      if (!(output.lock instanceof LockV1) || atom(output.nicks) === 0n)
-        throw new NockchainError("Invalid output");
-      const identity = formatDigest(output.lock.root);
+      if (atom(output.nicks) === 0n) throw new NockchainError("Invalid output");
+      const root =
+        output.lock instanceof LockV1 || output.lock instanceof LockTreeV1
+          ? output.lock.root
+          : digest(output.lock);
+      const identity = formatDigest(root);
       if (roots.has(identity))
         throw new NockchainError("Duplicate output lock");
       roots.add(identity);
       total = addAmount(total, output.nicks);
-      const metadata = output.lock.metadata();
+      const metadata =
+        output.noteData ??
+        (output.lock instanceof LockV1 || output.lock instanceof LockTreeV1
+          ? output.lock.metadata()
+          : 0n);
       const regular = foldHashes(
-        output.lock.root,
+        root,
         metadataHash(metadata),
         hashAtom(output.nicks),
         parent,
       );
       const seed = nounTuple(
         0n,
-        digestNoun(output.lock.root),
+        digestNoun(root),
         metadata,
         output.nicks,
         digestNoun(parent),
@@ -481,32 +660,34 @@ export function prepareTransactionV1(
         seeds,
         newTree(seed, 0n, regular, hashCell(hashAtom(0n), regular), false),
       );
-      outputs.push(
-        new OutputV1(output.lock.root, metadata, output.nicks, parent),
-      );
+      outputs.push(new OutputV1(root, metadata, output.nicks, parent));
     }
     if (total !== plan.note.nicks)
       throw new NockchainError("Input value differs from outputs plus fee");
     spends.push({
       name: plan.note.name,
-      lock: plan.lock,
+      lock: migrationNote ? migrationNote.lock : proof!.condition,
+      migrationNote,
+      proof,
+      preimages: Object.freeze([...preimages]),
       fee: plan.fee,
       seeds,
       outputs,
       signatures: [],
     });
   }
-  const transaction = assemble(spends),
+  const transaction = assemble(spends, fees, fundPolicy),
     review = transaction.summary();
-  if (review.feeNicks < review.minimumFeeNicks)
+  if (checkFee && review.feeNicks < review.minimumFeeNicks)
     throw new NockchainError(
       `Fee below minimum ${review.minimumFeeNicks} nicks`,
     );
   return transaction;
 }
 export function minimumTransactionFeeV1(
-  inputLocks: Iterable<LockV1>,
-  outputLocks: Iterable<LockV1>,
+  inputLocks: Iterable<LockFormV1 | LockMerkleProof>,
+  outputLocks: Iterable<LockFormV1>,
+  fees = new FeeParameters(),
 ): bigint {
   const inputs = Array.from(inputLocks),
     outputs = Array.from(outputLocks);
@@ -517,24 +698,31 @@ export function minimumTransactionFeeV1(
     outputs.length > MAX_TRANSFER_OUTPUTS
   )
     throw new NockchainError("Transaction size out of range");
-  if (![...inputs, ...outputs].every((lock) => lock instanceof LockV1))
-    throw new NockchainError("Invalid lock");
   const zero = digest([0n, 0n, 0n, 0n, 0n]);
-  const spends: Spend[] = inputs.map((lock) => ({
-    name: new NoteName(zero, zero),
-    lock,
-    fee: 0n,
-    seeds: null,
-    outputs: [],
-    signatures: [],
-  }));
+  const spends: Spend[] = inputs.map((lock) => {
+    const proof =
+      lock instanceof LockMerkleProof
+        ? lock
+        : buildLockMerkleProof(lock, 1, fees.height >= fees.bythosPhase);
+    return {
+      name: new NoteName(zero, zero),
+      lock: proof.condition,
+      migrationNote: null,
+      proof,
+      preimages: [],
+      fee: 0n,
+      seeds: null,
+      outputs: [],
+      signatures: [],
+    };
+  });
   spends[0] = {
     ...spends[0],
     outputs: outputs.map(
       (lock) => new OutputV1(lock.root, lock.metadata(), 0n, zero),
     ),
   };
-  return minimumFee(spends);
+  return minimumFee(spends, fees);
 }
 function parsePublic(noun: Noun): Uint8Array {
   const [x, y, marker] = parts(noun, 3);
@@ -560,7 +748,14 @@ function parseSignature(noun: Noun): Signature {
   return result;
 }
 /** Parse supported canonical V1 structure and embedded ID; verification is explicit. */
-export function parseTransactionV1(data: Uint8Array): TransactionV1 {
+export function parseTransactionV1(
+  data: Uint8Array,
+  {
+    fees = new FeeParameters(),
+    fundPolicy = null,
+    migrationNotes = [],
+  }: TransactionOptions = {},
+): TransactionV1 {
   const raw = cue(data);
   boundedNoun(raw);
   const [version, embedded, spendMap] = parts(raw, 3);
@@ -568,37 +763,66 @@ export function parseTransactionV1(data: Uint8Array): TransactionV1 {
     throw new NockchainError("Unsupported transaction version");
   const id = nounDigest(embedded),
     spends: Spend[] = [];
+  const migrationByName = new Map<string, NoteV0>();
+  for (const note of migrationNotes) {
+    if (!(note instanceof NoteV0) || migrationByName.has(note.name.key()))
+      throw new NockchainError("Invalid or duplicate migration input");
+    migrationByName.set(note.name.key(), note);
+  }
   readTree(spendMap, true, MAX_TRANSFER_INPUTS, (key, value) => {
     const [first, last, terminator] = parts(key, 3);
     if (terminator !== 0n) throw new NockchainError("Invalid note name");
     const name = new NoteName(nounDigest(first), nounDigest(last));
     const [version, witness, seedsNoun, fee] = parts(value, 4);
-    if (version !== 1n) throw new NockchainError("Unsupported spend version");
-    const [proof, signatureMap, hax, time] = parts(witness, 4);
-    if (hax !== 0n || time !== 0n)
-      throw new NockchainError("Unsupported witness");
-    const [tag, condition, axis] = parts(proof, 4);
-    if (tag !== 0x6c6c7566n || axis !== 1n)
-      throw new NockchainError("Unsupported lock proof");
-    const lock = parseCondition(condition);
-    if (!nounEqual(proof, lock.proof()))
-      throw new NockchainError("Lock proof does not match its root");
-    if (!digestEqual(name.first, noteFirstV1(lock.root)))
-      throw new NockchainError("Note name does not bind input lock");
+    let migrationNote: NoteV0 | null = null,
+      proof: LockMerkleProof | null = null,
+      lock: LockV1 | LockV0,
+      signatureMap: Noun,
+      preimages: readonly Noun[] = [];
+    if (version === 0n) {
+      migrationNote = migrationByName.get(name.key()) ?? null;
+      if (!migrationNote)
+        throw new NockchainError(
+          "Complete migration input required for inspection",
+        );
+      if (
+        !digestEqual(
+          migrationNote.name.first,
+          noteFirstV0(migrationNote.lock, migrationNote.timelock !== null),
+        )
+      )
+        throw new NockchainError("Migration input name does not bind its lock");
+      lock = migrationNote.lock;
+      signatureMap = witness;
+    } else if (version === 1n) {
+      const [proofNoun, signatures, hax, time] = parts(witness, 4);
+      signatureMap = signatures;
+      if (time !== 0n) throw new NockchainError("Witness tim must be zero");
+      proof = LockMerkleProof.fromNoun(proofNoun);
+      lock = proof.condition;
+      const fund = fundPolicy?.authenticates(proof, name.first) ?? false;
+      if (!fund && !proof.check(name.first))
+        throw new NockchainError("Lock proof does not authorize input");
+      if (proof.full && fees.height < fees.bythosPhase)
+        throw new NockchainError("Full proof precedes activation");
+      preimages = parsePreimages(hax);
+      checkUnlock(proof, preimages);
+    } else throw new NockchainError("Unsupported spend version");
     const signatures: SignedPKH[] = [],
       outputs: OutputV1[] = [];
     readTree(signatureMap, true, 32, (key, value) => {
-      const pkh = nounDigest(key),
-        [publicKey, signature] = parts(value, 2);
+      const [publicKey, signature] = migrationNote
+          ? [key, value]
+          : parts(value, 2),
+        pkh = migrationNote ? hashNoun(publicKey) : nounDigest(key);
       const encoded = parsePublic(publicKey),
         sig = parseSignature(signature);
       if (!digestEqual(hashNoun(publicKey), pkh) || !lock.authorizes(pkh))
         throw new NockchainError("Unauthorized signature key");
       signatures.push({ pkh, publicKey: encoded, signature: sig });
-      const hash = hashCell(
-        pkh,
-        hashCell(hashNoun(publicKey), hashNoun(signature)),
-      );
+      const hash = migrationNote
+        ? hashCell(pkh, hashNoun(signature))
+        : hashCell(pkh, hashCell(hashNoun(publicKey), hashNoun(signature)));
       return [hash, hash];
     });
     if (seedsNoun === 0n)
@@ -623,6 +847,9 @@ export function parseTransactionV1(data: Uint8Array): TransactionV1 {
     const spend = {
       name,
       lock,
+      migrationNote,
+      proof,
+      preimages,
       fee: atomValue(fee),
       seeds,
       outputs,
@@ -632,7 +859,7 @@ export function parseTransactionV1(data: Uint8Array): TransactionV1 {
     const hash = hashCell(name.hash(), spendHash(spend));
     return [hash, hash];
   });
-  const transaction = assemble(spends);
+  const transaction = assemble(spends, fees, fundPolicy);
   if (!digestEqual(transaction.id, id))
     throw new NockchainError("Transaction ID does not match contents");
   return transaction;

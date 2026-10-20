@@ -55,6 +55,7 @@ export type {
   HeightRange,
   TimelockV1,
   TimelockPolicy,
+  RequiredPkhPolicy,
   NoteRecordV1,
 } from "./locks.js";
 export {
@@ -72,6 +73,7 @@ export type {
   LockedSpendPlanV1,
   SpendSummaryV1,
   TransactionSummaryV1,
+  TransactionOptions,
 } from "./transaction.js";
 export {
   PreparedTransfer,
@@ -88,3 +90,46 @@ export type {
   TransferOptions,
   TransferSummary,
 } from "./wallet.js";
+
+export {
+  LockTreeV1,
+  LockMerkleProof,
+  buildLockMerkleProof,
+  parseLock,
+  validStubAxis,
+} from "./lock-tree.js";
+export type { LockFormV1 } from "./lock-tree.js";
+export {
+  NoteData,
+  LockData,
+  BridgeDepositDataPayload,
+  BridgeWithdrawalDataPayload,
+} from "./note-data.js";
+export type { NoteDataPayload, DecodedNoteDataEntry } from "./note-data.js";
+export {
+  FeeParameters,
+  ChainContext,
+  computeMinimumFee,
+  computeBridgeFee,
+  transactionWords,
+  noteDataWords,
+} from "./fee.js";
+export type {
+  FeeParametersOptions,
+  FeeBreakdown,
+  WordCountBreakdown,
+} from "./fee.js";
+export {
+  FundMaturity,
+  FundMaturityPolicy,
+  FundLockPolicy,
+  LockResolution,
+  SigningKeyLockMatcher,
+  LockRootLockMatcher,
+} from "./lock-resolver.js";
+export type { LockMatcher } from "./lock-resolver.js";
+export { PlannedOutput, plan } from "./planner.js";
+export type { PlanRequest, PlanResult } from "./planner.js";
+
+export { LockV0, NoteV0, noteFirstV0 } from "./migration.js";
+export type { NoteRecordV0 } from "./migration.js";
